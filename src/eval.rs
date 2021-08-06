@@ -303,12 +303,12 @@ pub enum EnvBuildError {
     NotARecord(RichTerm),
 }
 
-/// Add the bindings of a record to an environment.
+/// Add the bindings of a record to an environment. Ignore the fields defined by interpolation.
 pub fn env_add_term(env: &mut Environment, rt: RichTerm) -> Result<(), EnvBuildError> {
     let RichTerm { term, pos } = rt;
 
     match *term {
-        Term::Record(bindings, _) | Term::RecRecord(bindings, _) => {
+        Term::Record(bindings, _) | Term::RecRecord(bindings, ..) => {
             let ext = bindings.into_iter().map(|(id, t)| {
                 (
                     id,
@@ -622,7 +622,8 @@ where
                     env,
                 }
             }
-            Term::RecRecord(ts, attrs) => {
+            // TODO: implement interpolated fields
+            Term::RecRecord(ts, interpolated, attrs) => {
                 // Thanks to the share normal form transformation, the content is either a constant or a
                 // variable.
                 let rec_env = ts.iter().try_fold::<_, _, Result<Environment, EvalError>>(
@@ -885,7 +886,7 @@ pub fn subst(rt: RichTerm, global_env: &Environment, env: &Environment) -> RichT
 
                 RichTerm::new(Term::Record(map, attrs), pos)
             }
-            Term::RecRecord(map, attrs) => {
+            Term::RecRecord(map, interpolated, attrs) => {
                 let map = map
                     .into_iter()
                     .map(|(id, t)| {
@@ -896,7 +897,17 @@ pub fn subst(rt: RichTerm, global_env: &Environment, env: &Environment) -> RichT
                     })
                     .collect();
 
-                RichTerm::new(Term::RecRecord(map, attrs), pos)
+                let interpolated = interpolated
+                    .into_iter()
+                    .map(|(id_t, t)| {
+                        (
+                            subst_(id_t, global_env, env, Cow::Borrowed(bound.as_ref())),
+                            subst_(t, global_env, env, Cow::Borrowed(bound.as_ref())),
+                        )
+                    })
+                    .collect();
+
+                RichTerm::new(Term::RecRecord(map, interpolated, attrs), pos)
             }
             Term::List(ts) => {
                 let ts = ts

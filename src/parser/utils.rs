@@ -105,6 +105,7 @@ where
         (FieldPathElem::Expr(e), t) => dynamic_fields.push((e, t)),
     });
 
+<<<<<<< HEAD
     dynamic_fields
         .into_iter()
         .fold(Term::RecRecord(static_map, attrs), |rec, field| {
@@ -112,6 +113,15 @@ where
             Term::App(mk_term::op2(BinaryOp::DynExtend(), id_t, rec), t)
         },
     )
+=======
+    Term::RecRecord(static_map, dynamic_fields, attrs)
+    // dynamic_fields
+    //     .into_iter()
+    //     .fold(Term::RecRecord(static_map, attrs), |rec, field| {
+    //         let (id_t, t) = field;
+    //         Term::App(mk_term::op2(BinaryOp::DynExtend(), id_t, rec), t)
+    //     })
+>>>>>>> 7110929 (Add fields defined by interpolation in the representation of RecRecords)
 }
 
 /// Make a span from parser byte offsets.
