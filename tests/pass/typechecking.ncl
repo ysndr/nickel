@@ -164,6 +164,9 @@ let typecheck = [
 
   // full_annotations
   let x : Num | doc "some" | default = 1 in x + 1 : Num,
+
+  // recursive_records_quoted
+  {"foo" = 1} : {foo : Num},
 ] in
 
 
