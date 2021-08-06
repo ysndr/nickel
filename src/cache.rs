@@ -410,7 +410,7 @@ impl Cache {
                                 .collect();
                         *map = map_res?;
                     }
-                    Term::RecRecord(ref mut map, ref mut interpolated, _) => {
+                    Term::RecRecord(ref mut map, ref mut dyn_fields, _) => {
                         let map_res: Result<HashMap<Ident, RichTerm>, ImportError> =
                             std::mem::replace(map, HashMap::new())
                                 .into_iter()
@@ -420,8 +420,8 @@ impl Cache {
                                 })
                                 .collect();
 
-                        let interpolated_res: Result<Vec<(RichTerm, RichTerm)>, ImportError> =
-                            std::mem::replace(interpolated, Vec::new())
+                        let dyn_fields_res: Result<Vec<(RichTerm, RichTerm)>, ImportError> =
+                            std::mem::replace(dyn_fields, Vec::new())
                                 .into_iter()
                                 .map(|(id_t, t)| {
                                     Ok((
@@ -432,7 +432,7 @@ impl Cache {
                                 .collect();
 
                         *map = map_res?;
-                        *interpolated = interpolated_res?;
+                        *dyn_fields = dyn_fields_res?;
                     }
                     _ => panic!("cache::transform_inner(): not a record"),
                 }
