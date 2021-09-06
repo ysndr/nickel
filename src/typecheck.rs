@@ -473,6 +473,267 @@ pub fn type_check_in_env(
     Ok(to_type(&state.table, ty))
 }
 
+fn check(
+    state: &mut State,
+    mut envs: Envs,
+    strict: bool,
+    rt: &RichTerm,
+    ty: TypeWrapper
+    ) -> Result<(), TypecheckError> {
+    Ok(())
+}
+
+fn infer(
+    state: &mut State,
+    mut envs: Envs,
+    strict: bool,
+    rt: &RichTerm)
+    -> Result<TypeWrapper, TypecheckError> {
+    let RichTerm { term: t, pos } = rt;
+
+    match t.as_ref() {
+        // null is inferred to be of type Dyn
+        Term::Null => Ok(mk_typewrapper::dynamic()),
+        Term::Bool(_) => Ok(mk_typewrapper::bool()),
+        Term::Num(_) => Ok(mk_typewrapper::num()),
+        Term::Str(_) => Ok(mk_typewrapper::str()),
+        Term::StrChunks(chunks) => {
+            chunks
+                .iter()
+                .try_for_each(|chunk| -> Result<(), TypecheckError> {
+                    match chunk {
+                        StrChunk::Literal(_) => Ok(()),
+                        StrChunk::Expr(t, _) => {
+                            check(state, envs.clone(), strict, t, mk_typewrapper::str())
+                        }
+                    }
+                })?;
+            Ok(mk_typewrapper::str())
+        }
+        Term::Fun(x, t) => {
+            let src = TypeWrapper::Ptr(new_var(state.table));
+            // TODO what to do here, this makes more sense to me, but it means let x = foo in bar
+            // behaves quite different to (\x.bar) foo, worth considering if it's ok to type these two differently
+            // let src = TypeWrapper::The(AbsType::Dyn());
+            let trg = TypeWrapper::Ptr(new_var(state.table));
+            let arr = mk_tyw_arrow!(src.clone(), trg.clone());
+
+            envs.insert(x.clone(), src);
+            check(state, envs, strict, t, trg)?;
+            Ok(arr)
+        }
+        Term::List(terms) => {
+            let ty_elts = TypeWrapper::Ptr(new_var(state.table));
+
+            terms
+                .iter()
+                .try_for_each(|t| -> Result<(), TypecheckError> {
+                    check(state, envs.clone(), strict, t, ty_elts.clone())
+                })?;
+
+            Ok(mk_typewrapper::list(ty_elts))
+        }
+        // TODO implement lbl type
+        Term::Lbl(_) => Ok(mk_typewrapper::dynamic()),
+        Term::Let(x, re, rt) => {
+            let ty_var = binding_type(re.as_ref(), &envs, state.table, strict);
+            let ty_let = TypeWrapper::Ptr(new_var(state.table));
+            check(state, envs.clone(), strict, re, ty_var.clone())?;
+
+            // TODO move this up once lets are rec
+            envs.insert(x.clone(), ty_var);
+            check(state, envs, strict, rt, ty_let.clone())?;
+            Ok(ty_let)
+        }
+        Term::App(e, t) => {
+            let src = TypeWrapper::Ptr(new_var(state.table));
+            let tgt = TypeWrapper::Ptr(new_var(state.table));
+            let arr = mk_tyw_arrow!(src.clone(), tgt.clone());
+
+            let e_inferred = infer(state, envs.clone(), strict, e)?;
+            unify(state, strict, e_inferred, arr).map_err(|err| err.into_typecheck_err(state, rt.pos))?;
+
+            check(state, envs, strict, t, src)?;
+            Ok(tgt)
+        }
+        Term::Switch(exp, cases, default) => {
+            // Currently, if it has a default value, we typecheck the whole thing as
+            // taking ANY enum, since it's more permissive and there's no loss of information
+            let res = TypeWrapper::Ptr(new_var(state.table));
+
+            for case in cases.values() {
+                check(state, envs.clone(), strict, case, res.clone())?;
+            }
+
+            let row = match default {
+                Some(t) => {
+                    check(state, envs.clone(), strict, t, res.clone())?;
+                    TypeWrapper::Ptr(new_var(state.table))
+                }
+                None => cases.iter().try_fold(
+                    mk_typewrapper::row_empty(),
+                    |acc, x| -> Result<TypeWrapper, TypecheckError> {
+                        Ok(mk_tyw_enum_row!(x.0.clone(), acc))
+                    },
+                )?,
+            };
+
+            unify(state, strict, ty, res).map_err(|err| err.into_typecheck_err(state, rt.pos))?;
+            type_check_(state, envs, strict, exp, mk_tyw_enum!(row))
+        }
+        Term::Var(x) => {
+            let x_ty = envs
+                .get(&x)
+                .ok_or_else(|| TypecheckError::UnboundIdentifier(x.clone(), *pos))?;
+
+            let instantiated = instantiate_foralls(state, x_ty, ForallInst::Ptr);
+            unify(state, strict, ty, instantiated)
+                .map_err(|err| err.into_typecheck_err(state, rt.pos))
+        }
+        Term::Enum(id) => {
+            let row = TypeWrapper::Ptr(new_var(state.table));
+            unify(state, strict, ty, mk_tyw_enum!(id.clone(), row))
+                .map_err(|err| err.into_typecheck_err(state, rt.pos))
+        }
+        Term::Record(stat_map, _) | Term::RecRecord(stat_map, _) => {
+            // For recursive records, we look at the apparent type of each field and bind it in
+            // env before actually typechecking the content of fields
+            if let Term::RecRecord(..) = t.as_ref() {
+                for (id, rt) in stat_map {
+                    let tyw = binding_type(rt.as_ref(), &envs, state.table, strict);
+                    envs.insert(id.clone(), tyw);
+                }
+            }
+
+            let root_ty = if let TypeWrapper::Ptr(p) = ty {
+                get_root(state.table, p)
+            } else {
+                ty.clone()
+            };
+
+            if let TypeWrapper::Concrete(AbsType::DynRecord(rec_ty)) = root_ty {
+                // Checking for a dynamic record
+                stat_map
+                    .iter()
+                    .try_for_each(|(_, t)| -> Result<(), TypecheckError> {
+                        type_check_(state, envs.clone(), strict, t, (*rec_ty).clone())
+                    })
+            } else {
+                let row = stat_map.iter().try_fold(
+                    mk_tyw_row!(),
+                    |acc, (id, field)| -> Result<TypeWrapper, TypecheckError> {
+                        // In the case of a recursive record, new types (either type variables or
+                        // annotations) have already be determined and put in the typing
+                        // environment, and we need to use the same.
+                        let ty = if let Term::RecRecord(..) = t.as_ref() {
+                            envs.get(&id).unwrap()
+                        } else {
+                            TypeWrapper::Ptr(new_var(state.table))
+                        };
+
+                        type_check_(state, envs.clone(), strict, field, ty.clone())?;
+
+                        Ok(mk_tyw_row!((id.clone(), ty); acc))
+                    },
+                )?;
+
+                unify(state, strict, ty, mk_tyw_record!(; row))
+                    .map_err(|err| err.into_typecheck_err(state, rt.pos))
+            }
+        }
+        Term::Op1(op, t) => {
+            let (ty_arg, ty_res) = get_uop_type(state, op)?;
+
+            unify(state, strict, ty, ty_res)
+                .map_err(|err| err.into_typecheck_err(state, rt.pos))?;
+            type_check_(state, envs.clone(), strict, t, ty_arg)
+        }
+        Term::Op2(op, t1, t2) => {
+            let (ty_arg1, ty_arg2, ty_res) = get_bop_type(state, op)?;
+
+            unify(state, strict, ty, ty_res)
+                .map_err(|err| err.into_typecheck_err(state, rt.pos))?;
+            type_check_(state, envs.clone(), strict, t1, ty_arg1)?;
+            type_check_(state, envs, strict, t2, ty_arg2)
+        }
+        Term::OpN(op, args) => {
+            let (tys_op, ty_ret) = get_nop_type(state, op)?;
+
+            unify(state, strict, ty, ty_ret)
+                .map_err(|err| err.into_typecheck_err(state, rt.pos))?;
+
+            tys_op
+                .into_iter()
+                .zip(args.iter())
+                .try_for_each(|(ty_t, t)| {
+                    type_check_(state, envs.clone(), strict, t, ty_t)?;
+                    Ok(())
+                })?;
+
+            Ok(())
+        }
+        Term::Promise(ty2, _, t)
+        // A non-empty metavalue with a type annotation is a promise.
+        | Term::MetaValue(MetaValue {
+            types: Some(Contract { types: ty2, .. }),
+            value: Some(t),
+            ..
+        }) => {
+            let tyw2 = to_typewrapper(ty2.clone());
+
+            let instantiated = instantiate_foralls(state, tyw2.clone(), ForallInst::Constant);
+
+            unify(state, strict, ty, tyw2).map_err(|err| err.into_typecheck_err(state, rt.pos))?;
+            type_check_(state, envs, true, t, instantiated)
+        }
+        // A metavalue with at least one contract is an assume. If there's several
+        // contracts, we arbitrarily chose the first one as the type annotation.
+        Term::MetaValue(MetaValue {
+            contracts,
+            value,
+            ..
+        }) if !contracts.is_empty() => {
+            let ctr = contracts.get(0).unwrap();
+            let Contract { types: ty2, .. } = ctr;
+
+            unify(state, strict, ty, to_typewrapper(ty2.clone()))
+                .map_err(|err| err.into_typecheck_err(state, rt.pos))?;
+
+            // if there's an inner value, we have to recursively typecheck it, but in non strict
+            // mode.
+            if let Some(t) = value {
+                type_check_(state, envs, false, t, mk_typewrapper::dynamic())
+            }
+            else {
+                Ok(())
+            }
+        }
+        Term::Sym(_) => unify(state, strict, ty, mk_typewrapper::sym())
+            .map_err(|err| err.into_typecheck_err(state, rt.pos)),
+        Term::Wrapped(_, t) => type_check_(state, envs, strict, t, ty),
+        // A non-empty metavalue without a type or contract annotation is typechecked in the same way as its inner value
+        Term::MetaValue(MetaValue { value: Some(t), .. }) => {
+            type_check_(state, envs, strict, t, ty)
+        }
+        // A metavalue without a body nor a type annotation is a record field without definition.
+        // This should probably be non representable in the syntax, as it doesn't really make
+        // sense. In any case, we infer it to be of type `Dyn` for now.
+        Term::MetaValue(_) => {
+             unify(state, strict, ty, mk_typewrapper::dynamic())
+                .map_err(|err| err.into_typecheck_err(state, rt.pos))
+        },
+        Term::Import(_) => unify(state, strict, ty, mk_typewrapper::dynamic())
+            .map_err(|err| err.into_typecheck_err(state, rt.pos)),
+        Term::ResolvedImport(file_id) => {
+            let t = state
+                .resolver
+                .get(*file_id)
+                .expect("Internal error: resolved import not found ({:?}) during typechecking.");
+            type_check_in_env(&t, envs.global, state.resolver).map(|_ty| ())
+        }
+    }
+}
+
 /// Typecheck a term against a specific type.
 ///
 /// # Arguments
